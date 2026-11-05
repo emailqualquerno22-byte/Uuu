@@ -118,13 +118,20 @@ def load_mcp_configs(config_path: str = "mcp_servers/config.json") -> list[MCPCl
         with open(config_path, "r") as f:
             configs = json.load(f)
         clients = []
-        for cfg in configs:
+        # Support both dict-style {name: config} and list-style [{name: ..., ...}]
+        if isinstance(configs, dict):
+            items = [(name, cfg) for name, cfg in configs.items()]
+        else:
+            items = [(cfg.get("name", f"server-{i}"), cfg) for i, cfg in enumerate(configs)]
+        for name, cfg in items:
+            cfg = dict(cfg)  # copy
+            cfg["name"] = name
             client = MCPClient(cfg)
             if client.start():
                 clients.append(client)
-                print(f"  MCP server connected: {cfg.get('name', 'unknown')} ({len(client.tools)} tools)")
+                print(f"  MCP server connected: {name} ({len(client.tools)} tools)")
             else:
-                print(f"  MCP server skipped: {cfg.get('name', 'unknown')}")
+                print(f"  MCP server skipped: {name}")
         return clients
     except Exception as e:
         print(f"  MCP config load failed: {e}")
