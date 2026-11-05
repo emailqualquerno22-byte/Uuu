@@ -1,0 +1,12 @@
+{
+  "filesystem": {
+    "command": "python3",
+    "args": ["agents/mcp_servers/filesystem_server.py"],
+    "env": {}
+  },
+  "fetch": {
+    "command": "python3",
+    "args": ["agents/mcp_servers/fetch_server.py"],
+    "env": {}
+  }
+}
