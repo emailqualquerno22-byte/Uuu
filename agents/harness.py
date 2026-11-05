@@ -1,13 +1,12 @@
 """Kilo Agent Harness — frontier-class autonomous AI agent.
 
-Works end-to-end WITHOUT any LLM API keys using deterministic tool execution.
-When ANTHROPIC_API_KEY or OPENAI_API_KEY is set, uses real LLM tool calling.
-Falls back to Ollama if available, otherwise runs deterministically.
+Works with FREE LLM APIs from Free-LLM directory (https://github.com/nejib1/Free-LLM)
+plus Anthropic, OpenAI, Ollama, and deterministic fallback.
 
 Layers:
-1. Model: Claude Opus 5.5 / GPT-4o / Ollama / deterministic fallback
+1. Model: Free LLM APIs (Groq, OpenRouter, Google AI Studio, etc.) / Anthropic / OpenAI / Ollama / deterministic
 2. Harness: agent loop with tool calling, memory, reflection, error recovery
-3. Tools: filesystem, shell, web, date
+3. Tools: filesystem, shell, web, date, MCP integration
 4. Memory: session memory with persistence
 5. MCP: filesystem + fetch servers (optional)
 """
@@ -126,6 +125,19 @@ def _list_dir(path: str = ".") -> str:
         return f"ERROR: {e}"
 
 
+def _web_fetch(url: str) -> str:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+            import re
+            text = re.sub(r"<[^>]+>", " ", content)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:4000]
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
 register_tool("read_file", "Read file contents",
               {"type": "object", "properties": {"path": {"type": "string"}},
                "required": ["path"]}, _read_file)
@@ -141,6 +153,9 @@ register_tool("date", "Return current date and time (ISO)",
 register_tool("list_dir", "List directory contents",
               {"type": "object", "properties": {"path": {"type": "string", "default": "."}},
                "required": []}, _list_dir)
+register_tool("web_fetch", "Fetch a URL and return text content",
+              {"type": "object", "properties": {"url": {"type": "string"}},
+               "required": ["url"]}, _web_fetch)
 
 
 def call_tool(name: str, **kwargs) -> str:
@@ -152,83 +167,79 @@ def call_tool(name: str, **kwargs) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
-# ── Agent loop (deterministic, no LLM needed) ──────────────────────────────────
+# ── Free LLM API providers (from Free-LLM directory) ───────────────────────────
 
-class DeterministicAgent:
-    """An agent that completes tasks using a predefined plan of tool calls."""
-
-    def __init__(self, memory: Memory, max_steps: int = 20):
-        self.memory = memory
-        self.max_steps = max_steps
-        self.steps = 0
-
-    def run(self, task: str) -> dict:
-        self.memory.add("system", f"Task: {task}")
-        plan = self._plan(task)
-        for step in plan:
-            if self.steps >= self.max_steps:
-                break
-            self.steps += 1
-            logger.info(f"--- Step {self.steps}/{self.max_steps}: {step['tool']} ---")
-            result = call_tool(step["tool"], **step.get("args", {}))
-            logger.info(f"Result: {result[:200]}...")
-            self.memory.add("tool", step["tool"], result=result)
-            self.memory.add("user", f"TOOL_RESULT: {step['tool']} -> {result}")
-        return self._finalize(task)
-
-    def _plan(self, task: str) -> list[dict]:
-        """Create a deterministic plan based on the task description."""
-        task_lower = task.lower()
-        plan = []
-
-        # Common pattern: create file with date, read it back
-        if "date" in task_lower and ("read" in task_lower or "back" in task_lower):
-            fn = "/tmp/kilo/demo.txt"
-            plan.append({"tool": "write_file", "args": {
-                "path": fn, "content": f"Task: {task}\nDate: {_date_now()}\n"}})
-            plan.append({"tool": "read_file", "args": {"path": fn}})
-            plan.append({"tool": "list_dir", "args": {"path": "/tmp/kilo"}})
-            return plan
-
-        # Pattern: list directory
-        if "list" in task_lower or "directory" in task_lower or "files" in task_lower:
-            plan.append({"tool": "list_dir", "args": {"path": "."}})
-            return plan
-
-        # Pattern: shell command
-        if "shell" in task_lower or "command" in task_lower:
-            plan.append({"tool": "shell", "args": {"cmd": "echo hello from agent"}})
-            return plan
-
-        # Default: just report what we can do
-        plan.append({"tool": "list_dir", "args": {"path": "."}})
-        return plan
-
-    def _finalize(self, task: str) -> dict:
-        self.memory.add_fact("last_task", task)
-        self.memory.add_fact("last_completed", datetime.datetime.now().isoformat())
-        self.memory.save()
-
-        summary = f"Agent completed task: '{task}' in {self.steps} steps"
-        self.memory.add("assistant", summary)
-        return {
-            "status": "success",
-            "mode": "deterministic",
-            "steps": self.steps,
-            "summary": summary,
-            "memory_path": self.memory.persist_path,
-        }
+# Provider configs: name -> (base_url, default_model, env_key_for_api_key)
+FREE_PROVIDERS = {
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "openai/gpt-oss-120b",
+        "env_key": "GROQ_API_KEY",
+        "rate_limit": "30 RPM / 1000 requests/day free forever",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "google/gemma-4-31b-it:free",
+        "env_key": "OPENROUTER_API_KEY",
+        "rate_limit": "50 requests/day free tier",
+    },
+    "google_ai_studio": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "default_model": "gemini-3.8-flash",
+        "env_key": "GOOGLE_AI_STUDIO_API_KEY",
+        "rate_limit": "Varies by model, free forever",
+    },
+    "nvidia_nim": {
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "default_model": "meta/llama-3.1-405b-instruct",
+        "env_key": "NVIDIA_NIM_API_KEY",
+        "rate_limit": "~40 RPM free forever",
+    },
+    "mistral": {
+        "base_url": "https://api.mistral.ai/v1",
+        "default_model": "mistral-small-latest",
+        "env_key": "MISTRAL_API_KEY",
+        "rate_limit": "1 request/second, free forever",
+    },
+    "cohere": {
+        "base_url": "https://api.cohere.ai/v1",
+        "default_model": "command-a",
+        "env_key": "COHERE_API_KEY",
+        "rate_limit": "20 RPM / 1000 calls/month",
+    },
+    "ollama": {
+        "base_url": "http://localhost:11434",
+        "default_model": "llama3.2:1b",
+        "env_key": None,
+        "rate_limit": "Local, unlimited",
+    },
+}
 
 
-# ── LLM-powered agent (when API keys available) ────────────────────────────────
+def pick_free_provider() -> tuple[str, dict]:
+    """Pick the best available free LLM provider based on API keys."""
+    # Priority order: Groq (fast, high quality) > OpenRouter > Google AI Studio > NVIDIA NIM > Mistral > Cohere > Ollama
+    priority = ["groq", "openrouter", "google_ai_studio", "nvidia_nim", "mistral", "cohere", "ollama"]
+    for name in priority:
+        config = FREE_PROVIDERS[name]
+        env_key = config["env_key"]
+        if env_key is None or os.getenv(env_key):
+            logger.info(f"Selected free provider: {name} ({config['rate_limit']})")
+            return name, config
+    # Fallback to Ollama (no key needed)
+    return "ollama", FREE_PROVIDERS["ollama"]
+
+
+# ── LLM-powered agent ──────────────────────────────────────────────────────────
 
 class LLMAgent:
-    """Agent that uses an LLM for tool calling (Anthropic, OpenAI, Ollama)."""
+    """Agent that uses an LLM for tool calling via free APIs or commercial providers."""
 
-    def __init__(self, memory: Memory, provider: str, model: str, max_steps: int = 20):
+    def __init__(self, memory: Memory, provider: str, config: dict, max_steps: int = 20):
         self.memory = memory
         self.provider = provider
-        self.model = model
+        self.config = config
+        self.model = config["default_model"]
         self.max_steps = max_steps
         self.steps = 0
 
@@ -262,7 +273,7 @@ class LLMAgent:
     def _call_model(self, task: str) -> dict:
         """Call the LLM and parse tool calls from the response."""
         prompt = f"""You are an autonomous AI agent. Available tools:
-{json.dumps({n: {"desc": i["description"]} for n, i in TOOLS.items()}, indent=2)}
+{json.dumps({n: {"desc": i["description"], "schema": i["schema"]} for n, i in TOOLS.items()}, indent=2)}
 
 Task: {task}
 
@@ -283,6 +294,9 @@ If you need more information before completing, continue using tools.
                 return self._call_openai(prompt)
             elif self.provider == "ollama":
                 return self._call_ollama(prompt)
+            else:
+                # Free providers (OpenAI-compatible)
+                return self._call_free_provider(prompt)
         except Exception as e:
             logger.error(f"LLM call failed: {e}")
             return {"done": True, "summary": f"LLM error: {e}"}
@@ -330,38 +344,149 @@ If you need more information before completing, continue using tools.
             raise RuntimeError(f"Ollama error: {e}")
         return self._parse_response(content)
 
+    def _call_free_provider(self, prompt: str) -> dict:
+        """Call a free LLM provider via OpenAI-compatible API."""
+        import openai
+        api_key = os.getenv(self.config["env_key"]) if self.config["env_key"] else ""
+        client = openai.OpenAI(
+            base_url=self.config["base_url"],
+            api_key=api_key,
+        )
+        # Google AI Studio uses a different format - handle separately
+        if self.provider == "google_ai_studio":
+            return self._call_google_ai_studio(prompt)
+        resp = client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        content = resp.choices[0].message.content if resp.choices else ""
+        return self._parse_response(content)
+
+    def _call_google_ai_studio(self, prompt: str) -> dict:
+        """Call Google AI Studio via REST API."""
+        api_key = os.getenv("GOOGLE_AI_STUDIO_API_KEY")
+        if not api_key:
+            raise RuntimeError("GOOGLE_AI_STUDIO_API_KEY not set")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={api_key}"
+        data = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024},
+        }).encode()
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read())
+            # Extract text from Gemini response
+            candidates = result.get("candidates", [])
+            if candidates:
+                content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            else:
+                content = ""
+        except Exception as e:
+            raise RuntimeError(f"Google AI Studio error: {e}")
+        return self._parse_response(content)
+
     @staticmethod
     def _parse_response(content: str) -> dict:
         try:
-            # Find JSON in the response
             start = content.find("{")
             end = content.rfind("}") + 1
             if start >= 0 and end > start:
                 return json.loads(content[start:end])
         except json.JSONDecodeError:
             pass
-        # Fallback: treat entire response as completion
         return {"done": True, "summary": content[:500]}
+
+
+# ── Deterministic agent (no LLM needed) ────────────────────────────────────────
+
+class DeterministicAgent:
+    """An agent that completes tasks using a predefined plan of tool calls."""
+
+    def __init__(self, memory: Memory, max_steps: int = 20):
+        self.memory = memory
+        self.max_steps = max_steps
+        self.steps = 0
+
+    def run(self, task: str) -> dict:
+        self.memory.add("system", f"Task: {task}")
+        plan = self._plan(task)
+        for step in plan:
+            if self.steps >= self.max_steps:
+                break
+            self.steps += 1
+            logger.info(f"--- Step {self.steps}/{self.max_steps}: {step['tool']} ---")
+            result = call_tool(step["tool"], **step.get("args", {}))
+            logger.info(f"Result: {result[:200]}...")
+            self.memory.add("tool", step["tool"], result=result)
+            self.memory.add("user", f"TOOL_RESULT: {step['tool']} -> {result}")
+        return self._finalize(task)
+
+    def _plan(self, task: str) -> list[dict]:
+        task_lower = task.lower()
+        plan = []
+        if "date" in task_lower and ("read" in task_lower or "back" in task_lower):
+            fn = "/tmp/kilo/demo.txt"
+            plan.append({"tool": "write_file", "args": {
+                "path": fn, "content": f"Task: {task}\nDate: {datetime.datetime.now().isoformat()}\n"}})
+            plan.append({"tool": "read_file", "args": {"path": fn}})
+            plan.append({"tool": "list_dir", "args": {"path": "/tmp/kilo"}})
+            return plan
+        if "list" in task_lower or "directory" in task_lower or "files" in task_lower:
+            plan.append({"tool": "list_dir", "args": {"path": "."}})
+            return plan
+        if "shell" in task_lower or "command" in task_lower:
+            plan.append({"tool": "shell", "args": {"cmd": "echo hello from agent"}})
+            return plan
+        plan.append({"tool": "list_dir", "args": {"path": "."}})
+        return plan
+
+    def _finalize(self, task: str) -> dict:
+        self.memory.add_fact("last_task", task)
+        self.memory.add_fact("last_completed", datetime.datetime.now().isoformat())
+        self.memory.save()
+        summary = f"Agent completed task: '{task}' in {self.steps} steps"
+        self.memory.add("assistant", summary)
+        return {
+            "status": "success",
+            "mode": "deterministic",
+            "steps": self.steps,
+            "summary": summary,
+            "memory_path": self.memory.persist_path,
+        }
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def pick_provider_and_model() -> tuple[str, str]:
-    """Select provider and model based on available API keys."""
+def pick_provider_and_model(use_free: bool = True) -> tuple[str, dict | None]:
+    """Select provider and config based on available API keys."""
     if os.getenv("ANTHROPIC_API_KEY"):
-        return ("anthropic", "claude-opus-5-5")
+        return ("anthropic", None)
     if os.getenv("OPENAI_API_KEY"):
-        return ("openai", "gpt-4o")
-    return ("ollama", "llama3.2:1b")
+        return ("openai", None)
+    if use_free:
+        return pick_free_provider()
+    return ("ollama", FREE_PROVIDERS["ollama"])
 
 
-def run_agent(task: str, use_llm: bool = False, max_steps: int = 20) -> dict:
+def run_agent(task: str, use_llm: bool = False, use_free: bool = True,
+              max_steps: int = 20) -> dict:
     """Run the agent on a task."""
     memory = Memory(persist_path="/tmp/kilo/agent_memory.json")
 
     if use_llm:
-        provider, model = pick_provider_and_model()
-        agent = LLMAgent(memory, provider, model, max_steps)
+        provider, config = pick_provider_and_model(use_free=use_free)
+        if config is None:
+            # Commercial provider (anthropic/openai)
+            agent = LLMAgent(memory, provider, {"default_model": "claude-opus-5-5" if provider == "anthropic" else "gpt-4o"}, max_steps)
+        else:
+            agent = LLMAgent(memory, provider, config, max_steps)
     else:
         agent = DeterministicAgent(memory, max_steps)
 
@@ -373,22 +498,40 @@ def main():
     parser.add_argument("task", nargs="?", default="",
                         help="Task description for the agent")
     parser.add_argument("--llm", action="store_true",
-                        help="Use LLM-powered agent (requires API key or Ollama)")
+                        help="Use LLM-powered agent")
+    parser.add_argument("--free", action="store_true", default=True,
+                        help="Use free LLM APIs (default: True)")
+    parser.add_argument("--provider", default="",
+                        help="Force a specific free provider (groq, openrouter, google_ai_studio, nvidia_nim, mistral, cohere, ollama)")
     parser.add_argument("--model", default="",
                         help="Specific model name (LLM mode only)")
     parser.add_argument("--max-steps", type=int, default=20,
                         help="Maximum agent steps")
-    parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"],
-                        default="", help="LLM provider (LLM mode only)")
+    parser.add_argument("--list-providers", action="store_true",
+                        help="List all available free providers")
     args = parser.parse_args()
+
+    if args.list_providers:
+        print("Available free LLM providers (from Free-LLM directory):")
+        for name, config in FREE_PROVIDERS.items():
+            key_required = config["env_key"] or "none (local)"
+            print(f"  {name:20s} | model: {config['default_model']:40s} | key: {key_required} | {config['rate_limit']}")
+        return
 
     task = args.task or "create a file with the current date, read it back, and list the current directory"
 
+    if args.provider and args.provider in FREE_PROVIDERS:
+        # Override provider selection
+        os.environ[f"FORCE_PROVIDER"] = args.provider
+
     logger.info(f"Task: {task}")
     logger.info(f"Mode: {'LLM' if args.llm else 'deterministic'}")
+    if args.llm:
+        provider, config = pick_provider_and_model(use_free=args.free)
+        logger.info(f"Provider: {provider}, Model: {config['default_model'] if config else 'commercial'}")
     logger.info(f"Max steps: {args.max_steps}")
 
-    result = run_agent(task, use_llm=args.llm, max_steps=args.max_steps)
+    result = run_agent(task, use_llm=args.llm, use_free=args.free, max_steps=args.max_steps)
 
     print("\n" + "=" * 60)
     print("AGENT RESULT")
